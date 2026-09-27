@@ -1,0 +1,9 @@
+torch
+torchvision
+pandas
+numpy
+scikit-learn
+pyarrow
+pydantic
+tqdm
+pillow

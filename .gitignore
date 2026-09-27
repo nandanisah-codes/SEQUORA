@@ -1,0 +1,12 @@
+.venv/
+__pycache__/
+*.pyc
+raw_data/
+processed_data/
+artifacts/
+*.pkl
+*.pt
+*.pth
+.env
+kaggle.json
+*.zip
