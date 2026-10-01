@@ -8,3 +8,4 @@ pydantic
 tqdm
 pillow
 sentence-transformers
+faiss-cpu
