@@ -9,3 +9,4 @@ tqdm
 pillow
 sentence-transformers
 faiss-cpu
+lightgbm
