@@ -10,3 +10,4 @@ pillow
 sentence-transformers
 faiss-cpu
 lightgbm
+implicit
