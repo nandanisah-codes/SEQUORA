@@ -5,22 +5,27 @@ Compares every model on the SAME metric (Recall@10 / NDCG@10, same
 evaluation users, same evaluation logic) so the numbers are genuinely
 comparable:
 
-  Popularity   — non-personalized baseline: everyone gets the same
-                 most-popular items (minus their own history)
-  ALS          — classical collaborative filtering baseline
-  SASRec       — sequential engine
-  Two-Tower    — retrieval engine (via the real FAISS index)
-  Cold-start   — Two-Tower's accuracy specifically on items that had
-                 ZERO training interactions
+  Popularity         — everyone gets the all-time most-popular items
+  Popular last week  — everyone gets last training week's best sellers
+                       (read from processed_data/recent_popularity.json)
+  ALS                — classical collaborative filtering baseline
+  SASRec             — sequential engine
+  Two-Tower          — retrieval engine (via the real FAISS index)
+  Cold-start         — Two-Tower's accuracy specifically on items that had
+                       ZERO training interactions
+
+v2 changes: 10,000 evaluation users by default, hit counts reported next to
+every metric (so noise is visible), a last-week-popularity baseline, a
+memory-safe ALS matrix build, GPU use when available, and --skip-als.
 
 Every model is wrapped as a `recommend_fn(user_id) -> list[item_id]`, so
-one evaluation function handles all of them identically — no model gets
-an easier or harder test than another.
+one evaluation function handles all of them identically.
 """
 
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import logging
 import random
@@ -63,11 +68,11 @@ def evaluate_recommender(
     eligible_user_ids: Optional[List[int]] = None,
 ) -> Dict[str, float]:
     if eligible_user_ids is None:
-        eligible_user_ids = [uid for uid in val_sequences if uid in train_sequences]
+        eligible_user_ids = sorted(uid for uid in val_sequences if uid in train_sequences)
 
     if not eligible_user_ids:
         logger.warning("[%s] No eligible users to evaluate.", name)
-        return {"model": name, "recall_at_k": 0.0, "ndcg_at_k": 0.0, "n_eval_users": 0}
+        return {"model": name, "recall_at_k": 0.0, "ndcg_at_k": 0.0, "hits": 0, "n_eval_users": 0}
 
     rng = random.Random(seed)
     sampled = (
@@ -91,17 +96,18 @@ def evaluate_recommender(
         "model": name,
         "recall_at_k": hits / n,
         "ndcg_at_k": ndcg_sum / n,
+        "hits": hits,
         "n_eval_users": n,
     }
     logger.info(
-        "[%s] Recall@%d = %.4f, NDCG@%d = %.4f (n=%d users)",
-        name, k, metrics["recall_at_k"], k, metrics["ndcg_at_k"], n,
+        "[%s] Recall@%d = %.4f, NDCG@%d = %.4f (hits=%d of n=%d users)",
+        name, k, metrics["recall_at_k"], k, metrics["ndcg_at_k"], hits, n,
     )
     return metrics
 
 
 # --------------------------------------------------------------------------- #
-# Popularity baseline
+# Popularity baselines
 # --------------------------------------------------------------------------- #
 
 def build_popularity_ranking(train_sequences: Dict[int, Dict[str, List]]) -> List[int]:
@@ -109,8 +115,7 @@ def build_popularity_ranking(train_sequences: Dict[int, Dict[str, List]]) -> Lis
     for data in train_sequences.values():
         for item in data["items"]:
             counts[item] = counts.get(item, 0) + 1
-    ranked = sorted(counts, key=counts.get, reverse=True)
-    return ranked
+    return sorted(counts, key=counts.get, reverse=True)
 
 
 def make_popularity_recommend_fn(
@@ -135,17 +140,17 @@ def train_als(
     user_ids = sorted(train_sequences.keys())
     user_idx_map = {uid: i for i, uid in enumerate(user_ids)}
 
-    rows, cols, data = [], [], []
-    for uid, seq in train_sequences.items():
-        u = user_idx_map[uid]
-        for item in seq["items"]:
-            rows.append(u)
-            cols.append(item)
-            data.append(1.0)
-
-    matrix = sp.csr_matrix(
-        (data, (rows, cols)), shape=(len(user_ids), num_items + 1)
+    # numpy arrays instead of three 31M-element Python lists (saves several GB of RAM)
+    lens = np.fromiter((len(train_sequences[u]["items"]) for u in user_ids), dtype=np.int64, count=len(user_ids))
+    total = int(lens.sum())
+    rows = np.repeat(np.arange(len(user_ids), dtype=np.int32), lens)
+    cols = np.fromiter(
+        itertools.chain.from_iterable(train_sequences[u]["items"] for u in user_ids),
+        dtype=np.int32, count=total,
     )
+    data = np.ones(total, dtype=np.float32)
+
+    matrix = sp.csr_matrix((data, (rows, cols)), shape=(len(user_ids), num_items + 1))
 
     model = AlternatingLeastSquares(factors=factors, iterations=15, random_state=seed)
     model.fit(matrix)
@@ -169,7 +174,7 @@ def make_als_recommend_fn(model, matrix, user_idx_map: Dict[int, int], k: int) -
 # SASRec
 # --------------------------------------------------------------------------- #
 
-def load_sasrec(checkpoint_path: Path) -> SASRec:
+def load_sasrec(checkpoint_path: Path, device: torch.device) -> SASRec:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model = SASRec(
         num_items=ckpt["num_items"],
@@ -180,17 +185,20 @@ def load_sasrec(checkpoint_path: Path) -> SASRec:
         dropout=ckpt["dropout"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
     model.eval()
     return model
 
 
 def make_sasrec_recommend_fn(
-    model: SASRec, train_sequences: Dict[int, Dict[str, List]], max_len: int, k: int
+    model: SASRec, train_sequences: Dict[int, Dict[str, List]], max_len: int, k: int,
+    device: torch.device,
 ) -> RecommendFn:
     def recommend(user_id: int) -> List[int]:
         items = train_sequences.get(user_id, {}).get("items", [])
-        input_seq = torch.tensor([pad_left(items, max_len)], dtype=torch.long)
-        top_items = model.recommend(input_seq, k=k, exclude_seen=True)
+        input_seq = torch.tensor([pad_left(items, max_len)], dtype=torch.long, device=device)
+        with torch.no_grad():
+            top_items = model.recommend(input_seq, k=k, exclude_seen=True)
         return top_items[0].tolist()
     return recommend
 
@@ -199,7 +207,7 @@ def make_sasrec_recommend_fn(
 # Two-Tower + FAISS
 # --------------------------------------------------------------------------- #
 
-def load_two_tower(checkpoint_path: Path) -> TwoTower:
+def load_two_tower(checkpoint_path: Path, device: torch.device) -> TwoTower:
     ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     model = TwoTower(
         num_items=ckpt["num_items"],
@@ -208,6 +216,7 @@ def load_two_tower(checkpoint_path: Path) -> TwoTower:
         output_dim=ckpt["output_dim"],
     )
     model.load_state_dict(ckpt["model_state_dict"])
+    model.to(device)
     model.eval()
     return model
 
@@ -218,12 +227,13 @@ def make_two_tower_recommend_fn(
     train_sequences: Dict[int, Dict[str, List]],
     max_len: int,
     k: int,
+    device: torch.device,
 ) -> RecommendFn:
     def recommend(user_id: int) -> List[int]:
         items = train_sequences.get(user_id, {}).get("items", [])
-        input_seq = torch.tensor([pad_left(items, max_len)], dtype=torch.long)
+        input_seq = torch.tensor([pad_left(items, max_len)], dtype=torch.long, device=device)
         with torch.no_grad():
-            user_vec = model.encode_users(input_seq).numpy()
+            user_vec = model.encode_users(input_seq).cpu().numpy()
         _scores, result_ids = index.search(user_vec, k=k + len(items))
         seen = set(items)
         filtered = [int(i) for i in result_ids[0] if i != -1 and int(i) not in seen]
@@ -232,8 +242,8 @@ def make_two_tower_recommend_fn(
 
 
 # --------------------------------------------------------------------------- #
-# Cold-start evaluation (Two-Tower only, restricted to items with real
-# multimodal content vectors AND zero train interactions)
+# Cold-start evaluation (Two-Tower only, restricted to items with zero
+# train interactions)
 # --------------------------------------------------------------------------- #
 
 def evaluate_cold_start(
@@ -246,16 +256,17 @@ def evaluate_cold_start(
     seed: int,
 ) -> Dict[str, float]:
     cold_set = set(cold_item_ids)
-    eligible = [
+    eligible = sorted(
         uid for uid, seq in val_sequences.items()
         if uid in train_sequences and seq["items"][0] in cold_set
-    ]
+    )
     if not eligible:
         logger.warning(
             "No validation users have a cold-start item as their next interaction — "
-            "cold-start evaluation skipped (expand multimodal.py's --limit to cover more items)."
+            "cold-start evaluation skipped."
         )
-        return {"model": "two_tower_cold_start", "recall_at_k": None, "ndcg_at_k": None, "n_eval_users": 0}
+        return {"model": "two_tower_cold_start", "recall_at_k": None, "ndcg_at_k": None,
+                "hits": 0, "n_eval_users": 0}
 
     return evaluate_recommender(
         "two_tower_cold_start", recommend_fn, train_sequences, val_sequences,
@@ -268,6 +279,9 @@ def evaluate_cold_start(
 # --------------------------------------------------------------------------- #
 
 def run(args: argparse.Namespace) -> None:
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info("Using device: %s", device)
+
     article_id_map = json.loads((args.processed_dir / "article_id_map.json").read_text())
     num_items = max(article_id_map.values())
 
@@ -277,7 +291,7 @@ def run(args: argparse.Namespace) -> None:
 
     results = []
 
-    # 1. Popularity
+    # 1. Popularity (all-time)
     popularity_ranking = build_popularity_ranking(train_sequences)
     pop_fn = make_popularity_recommend_fn(train_sequences, popularity_ranking, args.eval_k)
     results.append(evaluate_recommender(
@@ -285,21 +299,36 @@ def run(args: argparse.Namespace) -> None:
         args.eval_k, args.eval_users, args.seed,
     ))
 
-    # 2. ALS
-    als_model, als_matrix, user_idx_map = train_als(
-        train_sequences, num_items, factors=args.als_factors, seed=args.seed
-    )
-    als_fn = make_als_recommend_fn(als_model, als_matrix, user_idx_map, args.eval_k)
-    results.append(evaluate_recommender(
-        "als", als_fn, train_sequences, val_sequences,
-        args.eval_k, args.eval_users, args.seed,
-    ))
+    # 2. Popularity (last training week)
+    recent_path = args.processed_dir / "recent_popularity.json"
+    if recent_path.exists():
+        recent_ranking = [int(i) for i in json.loads(recent_path.read_text())]
+        recent_fn = make_popularity_recommend_fn(train_sequences, recent_ranking, args.eval_k)
+        results.append(evaluate_recommender(
+            "popular_last_week", recent_fn, train_sequences, val_sequences,
+            args.eval_k, args.eval_users, args.seed,
+        ))
+    else:
+        logger.warning("recent_popularity.json not found — skipping last-week baseline.")
 
-    # 3. SASRec
+    # 3. ALS
+    if not args.skip_als:
+        als_model, als_matrix, user_idx_map = train_als(
+            train_sequences, num_items, factors=args.als_factors, seed=args.seed
+        )
+        als_fn = make_als_recommend_fn(als_model, als_matrix, user_idx_map, args.eval_k)
+        results.append(evaluate_recommender(
+            "als", als_fn, train_sequences, val_sequences,
+            args.eval_k, args.eval_users, args.seed,
+        ))
+    else:
+        logger.info("Skipping ALS (--skip-als).")
+
+    # 4. SASRec
     sasrec_path = args.artifacts_dir / "sasrec.pt"
     if sasrec_path.exists():
-        sasrec_model = load_sasrec(sasrec_path)
-        sasrec_fn = make_sasrec_recommend_fn(sasrec_model, train_sequences, args.max_len, args.eval_k)
+        sasrec_model = load_sasrec(sasrec_path, device)
+        sasrec_fn = make_sasrec_recommend_fn(sasrec_model, train_sequences, args.max_len, args.eval_k, device)
         results.append(evaluate_recommender(
             "sasrec", sasrec_fn, train_sequences, val_sequences,
             args.eval_k, args.eval_users, args.seed,
@@ -307,19 +336,21 @@ def run(args: argparse.Namespace) -> None:
     else:
         logger.warning("SASRec checkpoint not found at %s — skipping.", sasrec_path)
 
-    # 4. Two-Tower + FAISS
+    # 5. Two-Tower + FAISS
     two_tower_path = args.artifacts_dir / "two_tower.pt"
     faiss_path = args.artifacts_dir / "faiss_items.index"
     if two_tower_path.exists() and faiss_path.exists():
-        two_tower_model = load_two_tower(two_tower_path)
+        two_tower_model = load_two_tower(two_tower_path, device)
         faiss_index = FaissItemIndex.load(faiss_path, dim=two_tower_model.user_tower.mlp[-1].out_features)
-        tt_fn = make_two_tower_recommend_fn(two_tower_model, faiss_index, train_sequences, args.max_len, args.eval_k)
+        tt_fn = make_two_tower_recommend_fn(
+            two_tower_model, faiss_index, train_sequences, args.max_len, args.eval_k, device
+        )
         results.append(evaluate_recommender(
             "two_tower", tt_fn, train_sequences, val_sequences,
             args.eval_k, args.eval_users, args.seed,
         ))
 
-        # 5. Cold-start check using the same Two-Tower + FAISS pipeline
+        # 6. Cold-start check using the same Two-Tower + FAISS pipeline
         cold_metrics = evaluate_cold_start(
             tt_fn, cold_start_items, val_sequences, train_sequences,
             args.eval_k, args.eval_users, args.seed,
@@ -330,11 +361,11 @@ def run(args: argparse.Namespace) -> None:
 
     # --- save results table ---
     results_df = pd.DataFrame(results)
-    print("\n" + "=" * 70)
-    print("SEQUORA — BENCHMARK RESULTS")
-    print("=" * 70)
+    print("\n" + "=" * 78)
+    print("SEQUORA — BENCHMARK RESULTS (same users for every model)")
+    print("=" * 78)
     print(results_df.to_string(index=False))
-    print("=" * 70)
+    print("=" * 78)
 
     args.artifacts_dir.mkdir(parents=True, exist_ok=True)
     out_path = args.artifacts_dir / "benchmark_results.json"
@@ -348,8 +379,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
     parser.add_argument("--max-len", type=int, default=50)
     parser.add_argument("--eval-k", type=int, default=10)
-    parser.add_argument("--eval-users", type=int, default=2000)
+    parser.add_argument("--eval-users", type=int, default=10000)
     parser.add_argument("--als-factors", type=int, default=64)
+    parser.add_argument("--skip-als", action="store_true",
+                         help="Skip the ALS baseline (slow on a laptop; run it on the GPU machine).")
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 

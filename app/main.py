@@ -71,6 +71,7 @@ def recommend(req: RecommendRequest) -> RecommendResponse:
         user_id=req.user_id,
         session_item_ids=req.session_item_ids,
         top_k=req.top_k,
+        category=req.category,
     )
     latency_ms = (time.perf_counter() - start) * 1000
     _last_latency_ms = latency_ms

@@ -77,7 +77,7 @@ def clean_articles(articles: pd.DataFrame, text_cols: Tuple[str, ...]) -> pd.Dat
     if "price" in df.columns:
         df["price"] = pd.to_numeric(df["price"], errors="coerce")
 
-    df["image_path"] = df["article_id"].apply(lambda a: f"images/0{a[:2]}/0{a}.jpg")
+    df["image_path"] = df["article_id"].apply(lambda a: f"images/{a[:3]}/{a}.jpg")
     df["has_image_placeholder"] = False
 
     n_missing_desc = (df["text_blob"].str.len() == 0).sum()

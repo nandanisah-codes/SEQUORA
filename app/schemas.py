@@ -23,7 +23,12 @@ class RecommendRequest(BaseModel):
         description="Items clicked THIS session, most recent last. Used for cold-start "
                     "users (no user_id) or to blend with existing history.",
     )
-    top_k: int = Field(default=10, ge=1, le=50)
+    top_k: int = Field(default=10, ge=1, le=300)
+    category: Optional[str] = Field(
+        default=None,
+        description="Optional category (e.g. 'Dresses'). When set, the backend filters "
+                    "inside a much deeper candidate list so the category fills a full grid.",
+    )
 
 
 class RecommendedItem(BaseModel):

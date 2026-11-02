@@ -5,8 +5,14 @@ Trains the Two-Tower retrieval model on real H&M sequences + the
 multimodal content embeddings you already built, then builds a real
 FAISS index from the trained item vectors.
 
-Like train_sasrec.py, this subsamples users by default since training
-runs on CPU — raise --max-train-users later once everything works.
+v2 changes:
+  * uses the GPU automatically when one is available (CPU otherwise)
+  * batches are drawn directly on the device (data/dataset.py) — no per-sample
+    Python loops and no items.index() lookups
+  * an "epoch" is now --steps-per-epoch random batches (the old epoch was all
+    31M interactions, far too long to be useful)
+  * a missing content-embeddings file is allowed (content vectors become zeros)
+  * --max-train-users 0 means "use everyone"
 """
 
 from __future__ import annotations
@@ -22,10 +28,8 @@ from typing import Dict, List
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
 
 from data.dataset import TwoTowerDataset, load_sequences
-from data.preprocess import PreprocessConfig  # noqa: F401  (kept for reference/consistency)
 from models.two_tower import TwoTower
 from retrieval.faiss_index import FaissItemIndex
 
@@ -35,7 +39,7 @@ logger = logging.getLogger("sequora.train_two_tower")
 def subsample_users(
     sequences: Dict[int, Dict[str, List]], max_users: int, seed: int
 ) -> Dict[int, Dict[str, List]]:
-    if max_users is None or len(sequences) <= max_users:
+    if not max_users or len(sequences) <= max_users:
         return sequences
     rng = random.Random(seed)
     keep_ids = rng.sample(list(sequences.keys()), max_users)
@@ -44,28 +48,21 @@ def subsample_users(
     return subset
 
 
-def pad_left(seq: List[int], max_len: int) -> List[int]:
-    if len(seq) >= max_len:
-        return seq[-max_len:]
-    return [0] * (max_len - len(seq)) + seq
-
-
-def load_content_lookup(embeddings_path: Path) -> Dict[int, np.ndarray]:
+def load_content_lookup(embeddings_path: Path) -> Dict[str, np.ndarray]:
     """
     Loads item_content_embeddings.parquet (from models/multimodal.py) into
-    {article_id(str) -> vector}. Articles not yet encoded (because you ran
-    multimodal.py with --limit) simply won't be in this dict — those items
-    fall back to a zero content vector during training, which is fine for
-    getting the pipeline working end-to-end.
+    {article_id(str) -> vector}. Articles not yet encoded simply won't be in
+    this dict — those items get a zero content vector during training.
     """
+    if not embeddings_path.exists():
+        logger.warning("No content embeddings at %s — using zero content vectors.", embeddings_path)
+        return {}
     df = pd.read_parquet(embeddings_path)
     dim_cols = [c for c in df.columns if c.startswith("dim_")]
-    lookup = {
-        row["article_id"]: row[dim_cols].to_numpy(dtype=np.float32)
-        for _, row in df.iterrows()
-    }
-    logger.info("Loaded content vectors for %d articles (dim=%d)", len(lookup), len(dim_cols))
-    return lookup
+    vectors = df[dim_cols].to_numpy(dtype=np.float32)
+    ids = df["article_id"].astype(str).str.zfill(10).tolist()
+    logger.info("Loaded content vectors for %d articles (dim=%d)", len(ids), len(dim_cols))
+    return dict(zip(ids, vectors))
 
 
 def build_content_matrix(
@@ -73,11 +70,8 @@ def build_content_matrix(
     content_lookup: Dict[str, np.ndarray],
     content_dim: int,
 ) -> np.ndarray:
-    """
-    (num_items + 1, content_dim) matrix indexed by item_idx, so content_vecs[item_idx]
-    gives that item's content vector directly. Index 0 (padding) and any item
-    without an encoded content vector get zeros.
-    """
+    """(num_items + 1, content_dim) matrix indexed by item_idx. Index 0 (padding)
+    and any item without an encoded content vector get zeros."""
     num_items = max(article_id_map.values())
     matrix = np.zeros((num_items + 1, content_dim), dtype=np.float32)
     n_filled = 0
@@ -90,40 +84,11 @@ def build_content_matrix(
     return matrix
 
 
-def collate_with_content(
-    batch: List[Dict[str, torch.Tensor]],
-    sequences: Dict[int, Dict[str, List]],
-    content_matrix: np.ndarray,
-    max_len: int,
-) -> Dict[str, torch.Tensor]:
-    """Builds the (input_seq, item_id, content_vec) triple each training
-    step needs: input_seq is the user's history EXCLUDING the target item,
-    so the model can't just memorize the answer from the sequence."""
-    user_ids = [b["user_id"].item() for b in batch]
-    item_ids = [b["item_id"].item() for b in batch]
-
-    input_seqs = []
-    for user_id, item_id in zip(user_ids, item_ids):
-        items = sequences[user_id]["items"]
-        # use everything up to (not including) this specific occurrence of item_id
-        if item_id in items:
-            cut = items.index(item_id)
-        else:
-            cut = len(items)
-        input_seqs.append(pad_left(items[:cut], max_len))
-
-    content_vecs = content_matrix[item_ids]
-
-    return {
-        "input_seq": torch.tensor(input_seqs, dtype=torch.long),
-        "item_id": torch.tensor(item_ids, dtype=torch.long),
-        "content_vec": torch.tensor(content_vecs, dtype=torch.float32),
-    }
-
-
 def train(args: argparse.Namespace) -> None:
-    device = torch.device("cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Using device: %s", device)
+    if device.type == "cuda":
+        logger.info("GPU: %s", torch.cuda.get_device_name(0))
 
     article_id_map = json.loads((args.processed_dir / "article_id_map.json").read_text())
     num_items = max(article_id_map.values())
@@ -133,19 +98,11 @@ def train(args: argparse.Namespace) -> None:
 
     content_lookup = load_content_lookup(args.content_embeddings_path)
     content_matrix = build_content_matrix(article_id_map, content_lookup, args.content_dim)
+    content_gpu = torch.from_numpy(content_matrix).to(device)
 
-    dataset = TwoTowerDataset(train_sequences)
-    loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=0,
-        collate_fn=lambda batch: collate_with_content(
-            batch, train_sequences, content_matrix, args.max_len
-        ),
-        drop_last=True,  # in-batch negatives need a full batch every step
-    )
-    logger.info("Training batches per epoch: %d", len(loader))
+    t0 = time.time()
+    dataset = TwoTowerDataset(train_sequences, max_len=args.max_len, device=device)
+    logger.info("Built training tensors in %.1fs", time.time() - t0)
 
     model = TwoTower(
         num_items=num_items,
@@ -157,15 +114,28 @@ def train(args: argparse.Namespace) -> None:
 
     args.artifacts_dir.mkdir(parents=True, exist_ok=True)
 
+    def save_checkpoint(path: Path) -> None:
+        torch.save(
+            {
+                "model_state_dict": model.state_dict(),
+                "num_items": num_items,
+                "content_dim": args.content_dim,
+                "item_emb_dim": args.item_emb_dim,
+                "output_dim": args.output_dim,
+            },
+            path,
+        )
+
     for epoch in range(1, args.epochs + 1):
         model.train()
         epoch_start = time.time()
         total_loss = 0.0
 
-        for step, batch in enumerate(loader, start=1):
-            input_seq = batch["input_seq"].to(device)
-            item_id = batch["item_id"].to(device)
-            content_vec = batch["content_vec"].to(device)
+        for step in range(1, args.steps_per_epoch + 1):
+            batch = dataset.sample_batch(args.batch_size)
+            input_seq = batch["input_seq"]
+            item_id = batch["item_id"]
+            content_vec = content_gpu[item_id]
 
             optimizer.zero_grad()
             loss = model.compute_loss(input_seq, item_id, content_vec)
@@ -176,25 +146,20 @@ def train(args: argparse.Namespace) -> None:
             if step % args.log_every == 0:
                 logger.info(
                     "epoch %d step %d/%d — running avg loss %.4f",
-                    epoch, step, len(loader), total_loss / step,
+                    epoch, step, args.steps_per_epoch, total_loss / step,
                 )
 
-        avg_loss = total_loss / max(len(loader), 1)
+        avg_loss = total_loss / max(args.steps_per_epoch, 1)
         elapsed = time.time() - epoch_start
-        logger.info("Epoch %d done in %.1fs — avg loss %.4f", epoch, elapsed, avg_loss)
+        msg = f"Epoch {epoch} done in {elapsed:.1f}s — avg loss {avg_loss:.4f}"
+        if device.type == "cuda":
+            msg += f" — peak GPU memory {torch.cuda.max_memory_allocated() / 1e9:.2f} GB"
+        logger.info(msg)
+        save_checkpoint(args.artifacts_dir / f"two_tower_epoch{epoch}.pt")
 
-    # --- save model checkpoint ---
+    # --- save final model checkpoint ---
     checkpoint_path = args.artifacts_dir / "two_tower.pt"
-    torch.save(
-        {
-            "model_state_dict": model.state_dict(),
-            "num_items": num_items,
-            "content_dim": args.content_dim,
-            "item_emb_dim": args.item_emb_dim,
-            "output_dim": args.output_dim,
-        },
-        checkpoint_path,
-    )
+    save_checkpoint(checkpoint_path)
     logger.info("Saved Two-Tower checkpoint to %s", checkpoint_path)
 
     # --- build the real FAISS index from trained item vectors ---
@@ -207,10 +172,9 @@ def train(args: argparse.Namespace) -> None:
     with torch.no_grad():
         for start in range(0, len(all_item_ids), batch_size):
             chunk_ids = all_item_ids[start : start + batch_size]
-            chunk_content = content_matrix[chunk_ids]
-            id_tensor = torch.tensor(chunk_ids, dtype=torch.long)
-            content_tensor = torch.tensor(chunk_content, dtype=torch.float32)
-            vecs = model.encode_items(id_tensor, content_tensor).numpy()
+            id_tensor = torch.tensor(chunk_ids, dtype=torch.long, device=device)
+            content_tensor = content_gpu[id_tensor]
+            vecs = model.encode_items(id_tensor, content_tensor).cpu().numpy()
             index.add(chunk_ids.astype(np.int64), vecs)
 
     index_path = args.artifacts_dir / "faiss_items.index"
@@ -224,15 +188,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--artifacts-dir", type=Path, default=Path("artifacts"))
     parser.add_argument("--content-embeddings-path", type=Path,
                          default=Path("artifacts/item_content_embeddings.parquet"))
-    parser.add_argument("--max-train-users", type=int, default=50000)
+    parser.add_argument("--max-train-users", type=int, default=100000,
+                         help="Train on this many users. 0 = use everyone.")
     parser.add_argument("--max-len", type=int, default=50)
     parser.add_argument("--content-dim", type=int, default=128)
     parser.add_argument("--item-emb-dim", type=int, default=64)
     parser.add_argument("--output-dim", type=int, default=128)
-    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--batch-size", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--epochs", type=int, default=2)
-    parser.add_argument("--log-every", type=int, default=50)
+    parser.add_argument("--steps-per-epoch", type=int, default=3000)
+    parser.add_argument("--log-every", type=int, default=500)
     parser.add_argument("--seed", type=int, default=42)
     return parser.parse_args()
 

@@ -13,3 +13,5 @@ lightgbm
 implicit
 fastapi
 uvicorn
+streamlit
+requests
